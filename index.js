@@ -19,8 +19,8 @@ const ENV = {
   GUILD_ID: (process.env.GUILD_ID || "").trim(),
   VIP_ROLE_ID: (process.env.VIP_ROLE_ID || "").trim(),
   VIP_CHANNEL_ID: (process.env.VIP_CHANNEL_ID || "").trim(),
-  VIP_MESSAGE_ID: (process.env.VIP_MESSAGE_ID || "").trim(), // peut être vide
-  STAFF_ALERT_CHANNEL_ID: (process.env.STAFF_ALERT_CHANNEL_ID || "").trim(), // peut être égal à VIP_CHANNEL_ID
+  VIP_MESSAGE_ID: (process.env.VIP_MESSAGE_ID || "").trim(), // peut être vide au 1er run
+  STAFF_ALERT_CHANNEL_ID: (process.env.STAFF_ALERT_CHANNEL_ID || "").trim(), // tu peux mettre pareil que VIP_CHANNEL_ID
 };
 
 function must(name) {
@@ -36,8 +36,13 @@ must("VIP_ROLE_ID");
 must("VIP_CHANNEL_ID");
 must("STAFF_ALERT_CHANNEL_ID");
 
+// ===================== CONSTANTS =====================
+const EPHEMERAL_FLAGS = 1 << 6; // MessageFlags.Ephemeral
+const GRACE_DAYS = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 // ===================== JSON DB =====================
-// ⚠️ Sur Railway, le FS peut être éphémère selon configuration. Pour du 100% sûr -> SQLite + volume/DB.
+// ⚠️ Railway: FS peut être éphémère selon config. Pour du 100% durable -> SQLite + volume/DB.
 const DATA_DIR = path.join(process.cwd(), "data");
 const VIP_DB_FILE = path.join(DATA_DIR, "vip.json");
 
@@ -64,7 +69,7 @@ function saveVipDb(db) {
 //   permanent: boolean,
 //   expiresAt: string|null,
 //   note: string,
-//   alerts: { d7?: true, d3?: true, d1?: true, expired?: true },
+//   alerts: { d3?: true, d1?: true, d0?: true, g3?: true, removed?: true },
 //   updatedAt: string
 // }
 
@@ -74,14 +79,12 @@ const client = new Client({
   partials: [Partials.GuildMember],
 });
 
-// Avoid crash on Railway
+// avoid crash
 client.on("error", (e) => console.error("Client error:", e));
 process.on("unhandledRejection", (e) => console.error("UnhandledRejection:", e));
 process.on("uncaughtException", (e) => console.error("UncaughtException:", e));
 
 // ===================== HELPERS =====================
-const EPHEMERAL_FLAGS = 1 << 6; // MessageFlags.Ephemeral
-
 function nowIso() {
   return new Date().toISOString();
 }
@@ -145,7 +148,7 @@ function scheduleVipListUpdate(reason = "unknown") {
     } finally {
       isUpdating = false;
     }
-  }, 600); // quasi instant
+  }, 600);
 }
 
 async function buildVipListEmbed(guild) {
@@ -165,8 +168,7 @@ async function buildVipListEmbed(guild) {
 
 async function upsertVipListMessage() {
   const guild = await getGuild();
-  // garde members cache à jour pour role.members
-  await guild.members.fetch();
+  await guild.members.fetch(); // pour role.members fiable
 
   const channel = await getVipChannel();
   const embed = await buildVipListEmbed(guild);
@@ -195,80 +197,89 @@ async function upsertVipListMessage() {
   console.log("➡️ Mets ceci dans Railway Variables : VIP_MESSAGE_ID=" + msg.id);
 }
 
-// ===================== ALERTS & EXPIRATIONS =====================
+// ===================== ALERTS & GRACE =====================
 async function sendStaffAlert(text) {
   const ch = await getStaffAlertChannel();
   await ch.send({ content: text });
 }
 
+// Rappels + grâce 3 jours + retrait auto à J+3
 async function checkVipExpirations() {
   const db = loadVipDb();
   const guild = await getGuild();
   const roleId = ENV.VIP_ROLE_ID;
   const now = Date.now();
 
-  const thresholds = [
-    { key: "d7", ms: 7 * 24 * 60 * 60 * 1000, label: "dans 7 jours" },
-    { key: "d3", ms: 3 * 24 * 60 * 60 * 1000, label: "dans 3 jours" },
-    { key: "d1", ms: 1 * 24 * 60 * 60 * 1000, label: "dans 1 jour" },
-  ];
-
   let changed = false;
 
   for (const [userId, info] of Object.entries(db)) {
     info.alerts = info.alerts || {};
 
+    // permanents : rien à faire
     if (info.permanent) continue;
     if (!info.expiresAt) continue;
 
     const expMs = new Date(info.expiresAt).getTime();
-    const remaining = expMs - now;
+    const graceEndMs = expMs + GRACE_DAYS * DAY_MS;
 
-    // before expiry alerts
-    for (const t of thresholds) {
-      if (!info.alerts[t.key] && remaining <= t.ms && remaining > 0) {
-        info.alerts[t.key] = true;
-        changed = true;
+    const daysToExpire = Math.ceil((expMs - now) / DAY_MS);      // ex: 3, 1, 0, -1...
+    const daysPastExpire = Math.floor((now - expMs) / DAY_MS);   // ex: 0,1,2,3...
 
-        await sendStaffAlert(
-          `⏰ **Alerte VIP**: <@${userId}> expire **${t.label}** (expiration: <t:${Math.floor(
-            expMs / 1000
-          )}:F>).`
-        );
-      }
+    // ---- Rappels AVANT échéance ----
+    if (daysToExpire <= 3 && daysToExpire > 1 && !info.alerts.d3) {
+      info.alerts.d3 = true;
+      changed = true;
+      await sendStaffAlert(
+        `⏰ **Alerte VIP (J-3)** : <@${userId}> expire dans **3 jours** (échéance: <t:${Math.floor(expMs / 1000)}:F>).`
+      );
     }
 
-    // expired
-    if (remaining <= 0 && !info.alerts.expired) {
-      info.alerts.expired = true;
+    if (daysToExpire <= 1 && daysToExpire > 0 && !info.alerts.d1) {
+      info.alerts.d1 = true;
+      changed = true;
+      await sendStaffAlert(
+        `⏰ **Alerte VIP (J-1)** : <@${userId}> expire **demain** (échéance: <t:${Math.floor(expMs / 1000)}:F>).`
+      );
+    }
+
+    // ---- Échéance atteinte (début de grâce) ----
+    if (now >= expMs && now < graceEndMs && !info.alerts.d0) {
+      info.alerts.d0 = true;
+      changed = true;
+      await sendStaffAlert(
+        `⚠️ **VIP arrivé à échéance** : <@${userId}> a atteint la date d’échéance (échéance: <t:${Math.floor(
+          expMs / 1000
+        )}:F>). **Délai de grâce : ${GRACE_DAYS} jours**.`
+      );
+    }
+
+    // ---- Fin de grâce (J+3) : on retire le rôle ----
+    if (now >= graceEndMs && !info.alerts.removed) {
+      info.alerts.g3 = true;
+      info.alerts.removed = true;
       changed = true;
 
+      // Retrait du rôle VIP
       try {
         const member = await guild.members.fetch(userId);
         if (member.roles.cache.has(roleId)) {
-          await member.roles.remove(roleId, "VIP expired");
+          await member.roles.remove(roleId, "VIP expired after grace period");
         }
-
-        await sendStaffAlert(
-          `❌ **VIP expiré**: <@${userId}> vient d’expirer (expiration: <t:${Math.floor(
-            expMs / 1000
-          )}:F>). Rôle retiré automatiquement.`
-        );
       } catch {
-        await sendStaffAlert(
-          `❌ **VIP expiré**: <@${userId}> a expiré (expiration: <t:${Math.floor(
-            expMs / 1000
-          )}:F>). (Membre introuvable ou rôle déjà retiré)`
-        );
+        // membre absent ou impossible à fetch
       }
 
-      // option: garder l'historique. (on ne delete pas)
+      await sendStaffAlert(
+        `❌ **Fin de grâce (J+${GRACE_DAYS})** : <@${userId}> n’a pas été renouvelé. **Rôle VIP retiré automatiquement** (échéance initiale: <t:${Math.floor(
+          expMs / 1000
+        )}:F>, fin de grâce: <t:${Math.floor(graceEndMs / 1000)}:F>).`
+      );
     }
   }
 
   if (changed) saveVipDb(db);
 
-  // keep list synced
+  // garder la liste synchronisée
   scheduleVipListUpdate("expiry check");
 }
 
@@ -284,6 +295,7 @@ async function addOrExtendVip(userId, days, note = "") {
   };
 
   if (info.permanent) {
+    // VIP permanent : on ne touche pas à expiresAt
     info.updatedAt = nowIso();
     if (note) info.note = note;
     db[userId] = info;
@@ -293,14 +305,15 @@ async function addOrExtendVip(userId, days, note = "") {
 
   const now = Date.now();
   const baseMs = info.expiresAt ? new Date(info.expiresAt).getTime() : 0;
-  const start = baseMs > now ? new Date(baseMs) : new Date();
 
+  // Si déjà actif -> prolonge depuis expiresAt, sinon depuis maintenant
+  const start = baseMs > now ? new Date(baseMs) : new Date();
   const newExp = addDays(start, days);
 
   info.permanent = false;
   info.expiresAt = newExp.toISOString();
   info.note = note || info.note || "";
-  info.alerts = {}; // reset alerts when extended/created
+  info.alerts = {}; // reset alerts dès qu'on renouvelle
   info.updatedAt = nowIso();
 
   db[userId] = info;
@@ -422,7 +435,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const exp = Math.floor(new Date(res.expiresAt).getTime() / 1000);
       return interaction.reply({
-        content: `✅ VIP prolongé pour <@${user.id}> : **+${days} jours** → expire <t:${exp}:F>.`,
+        content: `✅ VIP prolongé pour <@${user.id}> : **+${days} jours** → expire <t:${exp}:F>. (grâce ${GRACE_DAYS} jours)`,
         flags: EPHEMERAL_FLAGS,
       });
     }
@@ -484,11 +497,17 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
-      const exp = info.expiresAt ? Math.floor(new Date(info.expiresAt).getTime() / 1000) : null;
+      const expMs = info.expiresAt ? new Date(info.expiresAt).getTime() : null;
+      const expTs = expMs ? Math.floor(expMs / 1000) : null;
+      const graceEndTs = expMs ? Math.floor((expMs + GRACE_DAYS * DAY_MS) / 1000) : null;
+
       return interaction.reply({
-        content: `👑 <@${user.id}> VIP temporaire.\n⏰ Expire: ${
-          exp ? `<t:${exp}:F>` : "—"
-        }\n📝 Note: ${info.note || "—"}\n🕒 Maj: ${info.updatedAt}`,
+        content:
+          `👑 <@${user.id}> VIP temporaire.\n` +
+          `⏰ Échéance: ${expTs ? `<t:${expTs}:F>` : "—"}\n` +
+          `🕒 Fin de grâce (${GRACE_DAYS}j): ${graceEndTs ? `<t:${graceEndTs}:F>` : "—"}\n` +
+          `📝 Note: ${info.note || "—"}\n` +
+          `🕒 Maj: ${info.updatedAt}`,
         flags: EPHEMERAL_FLAGS,
       });
     }
@@ -509,7 +528,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!permanent && info.expiresAt) {
           const expMs = new Date(info.expiresAt).getTime();
           expTs = Math.floor(expMs / 1000);
-          remainingDays = Math.ceil((expMs - now) / (24 * 60 * 60 * 1000));
+          remainingDays = Math.ceil((expMs - now) / DAY_MS);
         }
 
         return { userId, permanent, expTs, remainingDays, note: info.note || "—" };
@@ -548,8 +567,12 @@ client.on("interactionCreate", async (interaction) => {
 
         const d = r.remainingDays ?? "?";
         const when = r.expTs ? `<t:${r.expTs}:F>` : "—";
+
+        // code couleur simple
+        // d <= 0 -> déjà à échéance (grâce possible)
         const badge = d <= 0 ? "🔴" : d <= 3 ? "🟠" : d <= 7 ? "🟡" : "🟢";
-        return `${badge} <@${r.userId}> — expire ${when} (**J-${d}**) — ${r.note}`;
+
+        return `${badge} <@${r.userId}> — échéance ${when} (**J-${d}**) — ${r.note}`;
       });
 
       const header = expiringOnly
@@ -595,13 +618,10 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   const before = oldMember.roles.cache.has(vip);
   const after = newMember.roles.cache.has(vip);
 
-  if (before !== after) {
-    scheduleVipListUpdate(after ? "VIP added" : "VIP removed");
-  }
+  if (before !== after) scheduleVipListUpdate(after ? "VIP added" : "VIP removed");
 });
 
-client.on("guildMemberRemove", (member) => {
-  // list update (au cas où)
+client.on("guildMemberRemove", () => {
   scheduleVipListUpdate("member left");
 });
 
@@ -614,12 +634,12 @@ client.once("clientReady", async () => {
   // first list update
   scheduleVipListUpdate("startup");
 
-  // expiration check every hour
+  // scan échéances (toutes les 30 minutes = plus réactif)
   setInterval(() => {
     checkVipExpirations().catch((e) => console.error("❌ checkVipExpirations:", e?.message || e));
-  }, 60 * 60 * 1000);
+  }, 30 * 60 * 1000);
 
-  // safety list refresh every 15 min
+  // safety refresh list
   setInterval(() => scheduleVipListUpdate("periodic safety"), 15 * 60 * 1000);
 });
 
