@@ -10,8 +10,8 @@ const client = new Client({
 
 // --- Anti-spam update (debounce) ---
 let updateTimer = null;
+
 function scheduleUpdate(reason = "unknown") {
-  // regroupe plusieurs changements (ajouts/retraits multiples) en 1 update
   if (updateTimer) clearTimeout(updateTimer);
 
   updateTimer = setTimeout(async () => {
@@ -27,22 +27,22 @@ function scheduleUpdate(reason = "unknown") {
 
 function mustEnv(name) {
   const v = (process.env[name] || "").trim();
-  if (!v) throw new Error(`Variable manquante dans .env / Railway: ${name}`);
+  if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
 
 async function buildVipEmbed(guild) {
   const vipRoleId = mustEnv("VIP_ROLE_ID");
-  const role = await guild.roles.fetch(vipRoleId);
 
+  const role = await guild.roles.fetch(vipRoleId);
   const members = role ? [...role.members.values()] : [];
+
   members.sort((a, b) => a.displayName.localeCompare(b.displayName));
 
   const maxShow = 60;
   const lines = members
     .slice(0, maxShow)
     .map((m) => `• ${m.user} — ${m.displayName}`);
-
   const extra =
     members.length > maxShow ? `\n… +${members.length - maxShow} autres` : "";
 
@@ -54,37 +54,50 @@ async function buildVipEmbed(guild) {
 
 async function upsertVipMessage() {
   const guildId = mustEnv("GUILD_ID");
-  const vipChannelId = mustEnv("VIP_CHANNEL_ID");
+  const channelId = mustEnv("VIP_CHANNEL_ID");
 
   const guild = await client.guilds.fetch(guildId);
 
   // s'assure d'avoir les membres (sinon role.members peut être incomplet)
   await guild.members.fetch();
 
-  const channel = await client.channels.fetch(vipChannelId);
+  const channel = await client.channels.fetch(channelId);
   if (!channel?.isTextBased()) throw new Error("VIP_CHANNEL_ID n'est pas un salon texte.");
 
   const embed = await buildVipEmbed(guild);
 
   const existingId = (process.env.VIP_MESSAGE_ID || "").trim();
+
   if (existingId) {
-    // si message supprimé / pas accessible => on recrée
-    let msg = null;
-    try {
-      msg = await channel.messages.fetch(existingId);
-    } catch {
-      msg = null;
+    // edit du message existant
+    const msg = await channel.messages.fetch(existingId);
+    await msg.edit({ embeds: [embed] });
+  } else {
+    // création du message + on affiche l'ID à mettre dans Railway
+    const msg = await channel.send({ embeds: [embed] });
+    console.log("➡️ Mets ceci dans tes variables (Railway) : VIP_MESSAGE_ID=" + msg.id);
+  }
+}
+
+// ✅ Scan “fiable” (au cas où Discord ne déclenche pas guildMemberUpdate)
+async function checkVipRoleState(reason = "role scan") {
+  try {
+    const guildId = mustEnv("GUILD_ID");
+    const vipRoleId = mustEnv("VIP_ROLE_ID");
+
+    const guild = await client.guilds.fetch(guildId);
+    await guild.members.fetch();
+
+    const role = await guild.roles.fetch(vipRoleId);
+    if (!role) {
+      console.warn("⚠️ VIP_ROLE_ID introuvable (role fetch null).");
+      return;
     }
 
-    if (msg) {
-      await msg.edit({ embeds: [embed] });
-    } else {
-      const newMsg = await channel.send({ embeds: [embed] });
-      console.log("➡️ Mets ceci dans Railway variables : VIP_MESSAGE_ID=" + newMsg.id);
-    }
-  } else {
-    const msg = await channel.send({ embeds: [embed] });
-    console.log("➡️ Mets ceci dans Railway variables : VIP_MESSAGE_ID=" + msg.id);
+    console.log(`🔎 VIP role scan (${reason}) — ${role.members.size} membres`);
+    scheduleUpdate(reason);
+  } catch (e) {
+    console.error("❌ VIP role scan failed:", e?.message || e);
   }
 }
 
@@ -101,29 +114,23 @@ client.on("guildMemberUpdate", (oldMember, newMember) => {
   }
 });
 
-// (Optionnel) au cas où un membre quitte : si c'était un VIP, on update
-client.on("guildMemberRemove", async (member) => {
-  const vipRoleId = (process.env.VIP_ROLE_ID || "").trim();
-  if (!vipRoleId) return;
-
-  if (member.roles?.cache?.has(vipRoleId)) {
-    scheduleUpdate("VIP left server");
-  }
+client.on("guildMemberRemove", (member) => {
+  // parfois roles cache indispo sur remove, donc on déclenche juste un update safe
+  scheduleUpdate("member left");
 });
 
-// ✅ Discord.js v14+ : utiliser clientReady (au lieu de ready)
-client.once("clientReady", async () => {
+client.once("ready", async () => {
   console.log(`🤖 Connecté : ${client.user.tag}`);
 
   // update au démarrage
   await upsertVipMessage();
 
+  // scan de sécurité toutes les 2 minutes (fiable)
+  setInterval(() => checkVipRoleState("periodic role scan"), 2 * 60 * 1000);
+
   // garde un update "sécurité" toutes les 30 min (au cas où)
   setInterval(() => scheduleUpdate("periodic safety"), 30 * 60 * 1000);
 });
 
-// Sécurité: log erreurs sinon Railway redémarre en boucle sans info utile
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
-
+// ✅ Login
 client.login(mustEnv("DISCORD_TOKEN"));
