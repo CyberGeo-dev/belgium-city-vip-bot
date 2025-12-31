@@ -11,507 +11,270 @@ import {
 } from "discord.js";
 import { MongoClient } from "mongodb";
 
-// ===================== ENV =====================
+/* ===================== ENV ===================== */
 const ENV = {
-  DISCORD_TOKEN: (process.env.DISCORD_TOKEN || "").trim(),
-  CLIENT_ID: (process.env.CLIENT_ID || "").trim(),
-  GUILD_ID: (process.env.GUILD_ID || "").trim(),
-  VIP_ROLE_ID: (process.env.VIP_ROLE_ID || "").trim(),
-  VIP_CHANNEL_ID: (process.env.VIP_CHANNEL_ID || "").trim(),
-  VIP_MESSAGE_ID: (process.env.VIP_MESSAGE_ID || "").trim(), // peut être vide au 1er run
-  STAFF_ALERT_CHANNEL_ID: (process.env.STAFF_ALERT_CHANNEL_ID || "").trim(),
-  MONGODB_URI: (process.env.MONGODB_URI || "").trim(),
+  DISCORD_TOKEN: process.env.DISCORD_TOKEN,
+  CLIENT_ID: process.env.CLIENT_ID,
+  GUILD_ID: process.env.GUILD_ID,
+  VIP_ROLE_ID: process.env.VIP_ROLE_ID,
+  VIP_CHANNEL_ID: process.env.VIP_CHANNEL_ID,
+  STAFF_ALERT_CHANNEL_ID: process.env.STAFF_ALERT_CHANNEL_ID,
+  VIP_MESSAGE_ID: process.env.VIP_MESSAGE_ID || "",
+  MONGODB_URI: process.env.MONGODB_URI,
 };
 
-function must(name) {
-  const v = ENV[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
+for (const [k, v] of Object.entries(ENV)) {
+  if (!v && k !== "VIP_MESSAGE_ID") throw new Error(`Missing env: ${k}`);
 }
 
-must("DISCORD_TOKEN");
-must("CLIENT_ID");
-must("GUILD_ID");
-must("VIP_ROLE_ID");
-must("VIP_CHANNEL_ID");
-must("STAFF_ALERT_CHANNEL_ID");
-must("MONGODB_URI");
-
-// ===================== CONSTANTS =====================
-const EPHEMERAL_FLAGS = 1 << 6;
-const GRACE_DAYS = 3;
+/* ===================== CONSTANTS ===================== */
+const EPHEMERAL = 1 << 6;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const GRACE_DAYS = 3;
 
-// Rappels
-const REMIND_D3 = 3;
-const REMIND_D1 = 1;
-
-// Fréquences
-const EXPIRY_CHECK_EVERY_MS = 5 * 60 * 1000;    // 5 min
-const VIP_LIST_SAFETY_EVERY_MS = 15 * 60 * 1000; // 15 min
-
-// ===================== MONGODB =====================
-let mongo;
-let vipCol;
-
-async function initMongo() {
-  mongo = new MongoClient(ENV.MONGODB_URI);
-  await mongo.connect();
-  const db = mongo.db("vipbot");
-  vipCol = db.collection("vips");
-
-  // Index utile
-  await vipCol.createIndex({ userId: 1 }, { unique: true });
-  await vipCol.createIndex({ expiresAt: 1 });
-
-  console.log("✅ MongoDB connected");
-}
-
-// Document Mongo:
-// {
-//   userId: "123",
-//   permanent: true/false,
-//   expiresAt: Date | null,
-//   note: "texte",
-//   alerts: { d3:true, d1:true, d0:true, removed:true },
-//   updatedAt: Date
-// }
-
-// ===================== CLIENT =====================
+/* ===================== CLIENT ===================== */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
   partials: [Partials.GuildMember],
 });
 
-client.on("error", (e) => console.error("Client error:", e));
-process.on("unhandledRejection", (e) => console.error("UnhandledRejection:", e));
-process.on("uncaughtException", (e) => console.error("UncaughtException:", e));
+/* ===================== MONGODB ===================== */
+let vipCol;
 
-// ===================== HELPERS =====================
-function addDays(baseDate, days) {
-  const d = new Date(baseDate);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
+async function initMongo() {
+  const mongo = new MongoClient(ENV.MONGODB_URI);
+  await mongo.connect();
+  vipCol = mongo.db("vipbot").collection("vips");
+  await vipCol.createIndex({ userId: 1 }, { unique: true });
+  console.log("✅ MongoDB connected");
 }
 
-async function getGuild() {
-  return await client.guilds.fetch(ENV.GUILD_ID);
+/* ===================== HELPERS ===================== */
+const unix = (d) => Math.floor(d.getTime() / 1000);
+const addDays = (d, n) => new Date(d.getTime() + n * DAY_MS);
+
+async function guild() {
+  return client.guilds.fetch(ENV.GUILD_ID);
 }
 
-async function getVipChannel() {
-  const ch = await client.channels.fetch(ENV.VIP_CHANNEL_ID);
-  if (!ch?.isTextBased()) throw new Error("VIP_CHANNEL_ID n'est pas un salon texte.");
-  return ch;
+async function vipChannel() {
+  const c = await client.channels.fetch(ENV.VIP_CHANNEL_ID);
+  if (!c?.isTextBased()) throw new Error("VIP channel invalid");
+  return c;
 }
 
-async function getStaffAlertChannel() {
-  const ch = await client.channels.fetch(ENV.STAFF_ALERT_CHANNEL_ID);
-  if (!ch?.isTextBased()) throw new Error("STAFF_ALERT_CHANNEL_ID n'est pas un salon texte.");
-  return ch;
+async function staffChannel() {
+  const c = await client.channels.fetch(ENV.STAFF_ALERT_CHANNEL_ID);
+  if (!c?.isTextBased()) throw new Error("Staff channel invalid");
+  return c;
 }
 
-function isAdminInteraction(interaction) {
-  return (
-    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
-    interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
-  );
-}
-
-async function sendStaffAlert(text) {
-  const ch = await getStaffAlertChannel();
-  await ch.send({ content: text });
-}
-
-function toUnixTs(date) {
-  return Math.floor(date.getTime() / 1000);
-}
-
-// ===================== VIP LIST (ONE MESSAGE) =====================
-let updateTimer = null;
-let isUpdating = false;
-let blockedUntil = 0;
-
-function scheduleVipListUpdate(reason = "unknown") {
-  if (updateTimer) clearTimeout(updateTimer);
-
+/* ===================== VIP LIST MESSAGE ===================== */
+let updateTimer;
+async function updateVipList(reason = "unknown") {
+  clearTimeout(updateTimer);
   updateTimer = setTimeout(async () => {
-    const now = Date.now();
-    if (now < blockedUntil) return;
-    if (isUpdating) return;
+    const g = await guild();
+    await g.members.fetch();
 
-    isUpdating = true;
-    try {
-      await upsertVipListMessage();
-      console.log(`✅ VIP list updated (${reason})`);
-    } catch (e) {
-      const msg = e?.message || String(e);
-      const m = msg.match(/Retry after\s+([0-9.]+)\s*seconds?/i);
-      if (m) {
-        const sec = parseFloat(m[1]);
-        blockedUntil = Date.now() + Math.ceil(sec * 1000) + 1500;
-        console.warn(`🚦 Rate limited: waiting ${sec}s`);
-      } else {
-        console.error("❌ VIP list update failed:", msg);
+    const role = await g.roles.fetch(ENV.VIP_ROLE_ID);
+    const members = [...role.members.values()].sort((a, b) =>
+      a.displayName.localeCompare(b.displayName, "fr")
+    );
+
+    const lines = members.slice(0, 60).map(m => `• ${m.user} — ${m.displayName}`);
+    const embed = new EmbedBuilder()
+      .setTitle("👑 Liste des VIP")
+      .setDescription(`**Total : ${members.length} VIP**\n\n${lines.join("\n")}`)
+      .setTimestamp();
+
+    const ch = await vipChannel();
+
+    if (ENV.VIP_MESSAGE_ID) {
+      try {
+        const msg = await ch.messages.fetch(ENV.VIP_MESSAGE_ID);
+        return msg.edit({ embeds: [embed] });
+      } catch {
+        ENV.VIP_MESSAGE_ID = "";
       }
-    } finally {
-      isUpdating = false;
     }
+
+    const msg = await ch.send({ embeds: [embed] });
+    ENV.VIP_MESSAGE_ID = msg.id;
+    console.log("➡️ VIP_MESSAGE_ID =", msg.id);
   }, 600);
 }
 
-async function buildVipListEmbed(guild) {
-  const role = await guild.roles.fetch(ENV.VIP_ROLE_ID).catch(() => null);
-  const members = role ? [...role.members.values()] : [];
-  members.sort((a, b) => a.displayName.localeCompare(b.displayName, "fr"));
-
-  const maxShow = 60;
-  const lines = members.slice(0, maxShow).map((m) => `• ${m.user} — ${m.displayName}`);
-  const extra = members.length > maxShow ? `\n… +${members.length - maxShow} autres` : "";
-
-  return new EmbedBuilder()
-    .setTitle("👑 Liste des VIP")
-    .setDescription(`**Total : ${members.length} VIP**\n\n${lines.join("\n")}${extra}`)
-    .setTimestamp(new Date());
-}
-
-async function upsertVipListMessage() {
-  const guild = await getGuild();
-  await guild.members.fetch();
-
-  const channel = await getVipChannel();
-  const embed = await buildVipListEmbed(guild);
-
-  const msgId = (ENV.VIP_MESSAGE_ID || "").trim();
-
-  if (msgId) {
-    try {
-      const msg = await channel.messages.fetch(msgId);
-      await msg.edit({ embeds: [embed] });
-      return;
-    } catch (e) {
-      if (e?.code === 10008) {
-        console.warn("⚠️ VIP_MESSAGE_ID invalide (message supprimé) → recréation…");
-        ENV.VIP_MESSAGE_ID = "";
-      } else if (e?.code === 50001) {
-        throw new Error("Missing Access: le bot n'a pas accès au salon VIP (permissions).");
-      } else {
-        throw e;
-      }
-    }
-  }
-
-  const msg = await channel.send({ embeds: [embed] });
-  ENV.VIP_MESSAGE_ID = msg.id;
-  console.log("➡️ Mets ceci dans Railway Variables : VIP_MESSAGE_ID=" + msg.id);
-}
-
-// ===================== VIP DB (Mongo) =====================
-async function getVip(userId) {
-  return await vipCol.findOne({ userId });
-}
-
-async function upsertVip(userId, patch) {
-  await vipCol.updateOne(
-    { userId },
-    {
-      $set: {
-        ...patch,
-        userId,
-        updatedAt: new Date(),
-      },
-      $setOnInsert: { alerts: {} },
-    },
-    { upsert: true }
-  );
-}
-
-async function deleteVip(userId) {
-  await vipCol.deleteOne({ userId });
-}
-
-async function addOrExtendVip(userId, days, note = "") {
-  const existing = await getVip(userId);
-
-  // permanent -> on touche pas expiresAt
-  if (existing?.permanent) {
-    await upsertVip(userId, { note: note || existing.note || "" });
-    return { mode: "permanent", expiresAt: null };
-  }
-
-  const now = Date.now();
-  const baseMs = existing?.expiresAt ? new Date(existing.expiresAt).getTime() : 0;
-  const start = baseMs > now ? new Date(baseMs) : new Date();
-  const newExp = addDays(start, days);
-
-  await upsertVip(userId, {
-    permanent: false,
-    expiresAt: newExp,
-    note: note || existing?.note || "",
-    alerts: {}, // reset alert flags on renew
-  });
-
-  return { mode: "temporary", expiresAt: newExp.toISOString() };
-}
-
-async function setPermanentVip(userId, note = "") {
-  await upsertVip(userId, {
-    permanent: true,
-    expiresAt: null,
-    note: note || "VIP permanent",
-    alerts: {},
-  });
-}
-
-// ===================== EXPIRATIONS + GRACE =====================
-async function checkVipExpirations() {
-  const guild = await getGuild();
+/* ===================== EXPIRATIONS ===================== */
+async function checkExpirations() {
+  const g = await guild();
   const roleId = ENV.VIP_ROLE_ID;
   const now = Date.now();
 
-  const cursor = vipCol.find({ permanent: { $ne: true }, expiresAt: { $ne: null } });
-  for await (const info of cursor) {
-    const userId = info.userId;
-    const alerts = info.alerts || {};
+  const cursor = vipCol.find({ permanent: false, expiresAt: { $ne: null } });
+  for await (const vip of cursor) {
+    const exp = new Date(vip.expiresAt);
+    const graceEnd = addDays(exp, GRACE_DAYS);
+    const daysLeft = Math.ceil((exp - now) / DAY_MS);
+    const alerts = vip.alerts || {};
 
-    const expMs = new Date(info.expiresAt).getTime();
-    const graceEndMs = expMs + GRACE_DAYS * DAY_MS;
-
-    const daysToExpire = Math.ceil((expMs - now) / DAY_MS);
-
-    // J-3
-    if (daysToExpire <= REMIND_D3 && daysToExpire > REMIND_D1 && !alerts.d3) {
+    if (daysLeft === 3 && !alerts.d3) {
       alerts.d3 = true;
-      await vipCol.updateOne({ userId }, { $set: { alerts } });
-      await sendStaffAlert(
-        `⏰ **Alerte VIP (J-3)** : <@${userId}> expire dans **3 jours** (échéance: <t:${Math.floor(expMs / 1000)}:F>).`
+      await staffChannel().then(c =>
+        c.send(`⏰ **J-3** : <@${vip.userId}> expire le <t:${unix(exp)}:F>`)
       );
     }
 
-    // J-1
-    if (daysToExpire <= REMIND_D1 && daysToExpire > 0 && !alerts.d1) {
+    if (daysLeft === 1 && !alerts.d1) {
       alerts.d1 = true;
-      await vipCol.updateOne({ userId }, { $set: { alerts } });
-      await sendStaffAlert(
-        `⏰ **Alerte VIP (J-1)** : <@${userId}> expire **demain** (échéance: <t:${Math.floor(expMs / 1000)}:F>).`
+      await staffChannel().then(c =>
+        c.send(`⏰ **J-1** : <@${vip.userId}> expire demain`)
       );
     }
 
-    // J0 (échéance)
-    if (now >= expMs && now < graceEndMs && !alerts.d0) {
+    if (now >= exp && now < graceEnd && !alerts.d0) {
       alerts.d0 = true;
-      await vipCol.updateOne({ userId }, { $set: { alerts } });
-      await sendStaffAlert(
-        `⚠️ **VIP arrivé à échéance** : <@${userId}> (échéance: <t:${Math.floor(expMs / 1000)}:F>). **Délai de grâce : ${GRACE_DAYS} jours**.`
+      await staffChannel().then(c =>
+        c.send(`⚠️ **Échéance atteinte** : <@${vip.userId}> (grâce ${GRACE_DAYS}j)`)
       );
     }
 
-    // fin de grâce => retrait rôle
-    if (now >= graceEndMs && !alerts.removed) {
+    if (now >= graceEnd && !alerts.removed) {
       alerts.removed = true;
-      await vipCol.updateOne({ userId }, { $set: { alerts } });
-
       try {
-        const member = await guild.members.fetch(userId);
-        if (member.roles.cache.has(roleId)) {
-          await member.roles.remove(roleId, "VIP expired after grace period");
-        }
+        const m = await g.members.fetch(vip.userId);
+        await m.roles.remove(roleId);
       } catch {}
-
-      await sendStaffAlert(
-        `❌ **Fin de grâce (J+${GRACE_DAYS})** : <@${userId}> non renouvelé → **VIP retiré automatiquement** (échéance: <t:${Math.floor(
-          expMs / 1000
-        )}:F>, fin de grâce: <t:${Math.floor(graceEndMs / 1000)}:F>).`
+      await staffChannel().then(c =>
+        c.send(`❌ **VIP retiré** : <@${vip.userId}> (fin de grâce)`)
       );
-
-      scheduleVipListUpdate("expired removed");
+      updateVipList("expired");
     }
+
+    await vipCol.updateOne({ userId: vip.userId }, { $set: { alerts } });
   }
 }
 
-// ===================== SLASH COMMANDS =====================
+/* ===================== SLASH COMMANDS ===================== */
 const commands = [
   new SlashCommandBuilder()
     .setName("vip_add")
-    .setDescription("Ajoute / prolonge un VIP (en jours, ex: 30 = 1 mois).")
-    .addUserOption((o) => o.setName("joueur").setDescription("Le joueur").setRequired(true))
-    .addIntegerOption((o) => o.setName("jours").setDescription("Nombre de jours (ex: 30, 60, 90)").setRequired(true))
-    .addStringOption((o) => o.setName("note").setDescription("Note interne").setRequired(false))
+    .setDescription("Ajoute ou prolonge un VIP")
+    .addUserOption(o => o.setName("joueur").setRequired(true))
+    .addIntegerOption(o => o.setName("jours").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("vip_perm")
-    .setDescription("Met un VIP permanent.")
-    .addUserOption((o) => o.setName("joueur").setDescription("Le joueur").setRequired(true))
-    .addStringOption((o) => o.setName("note").setDescription("Note interne").setRequired(false))
+    .setDescription("Met un VIP permanent")
+    .addUserOption(o => o.setName("joueur").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("vip_remove")
-    .setDescription("Retire le rôle VIP et supprime l'enregistrement.")
-    .addUserOption((o) => o.setName("joueur").setDescription("Le joueur").setRequired(true))
+    .setDescription("Retire le VIP")
+    .addUserOption(o => o.setName("joueur").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("vip_info")
-    .setDescription("Affiche les infos VIP d'un joueur.")
-    .addUserOption((o) => o.setName("joueur").setDescription("Le joueur").setRequired(true))
+    .setDescription("Infos VIP d’un joueur")
+    .addUserOption(o => o.setName("joueur").setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("vip_list")
+    .setDescription("Liste tous les VIP")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("vip_refresh")
-    .setDescription("Force la mise à jour de la liste VIP.")
+    .setDescription("Force la mise à jour de la liste")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-].map((c) => c.toJSON());
+].map(c => c.toJSON());
 
-async function registerGuildCommands() {
-  const rest = new REST({ version: "10" }).setToken(ENV.DISCORD_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(ENV.CLIENT_ID, ENV.GUILD_ID), { body: commands });
-  console.log("✅ Slash commands registered (guild).");
-}
+/* ===================== INTERACTIONS ===================== */
+client.on("interactionCreate", async (i) => {
+  if (!i.isChatInputCommand()) return;
 
-// ===================== INTERACTIONS =====================
-client.on("interactionCreate", async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  const g = await guild();
+  const role = await g.roles.fetch(ENV.VIP_ROLE_ID);
 
-  if (!isAdminInteraction(interaction)) {
-    return interaction.reply({ content: "❌ Tu n'as pas la permission.", flags: EPHEMERAL_FLAGS });
+  if (i.commandName === "vip_add") {
+    const u = i.options.getUser("joueur");
+    const days = i.options.getInteger("jours");
+    const m = await g.members.fetch(u.id);
+
+    await m.roles.add(role);
+    const exp = addDays(new Date(), days);
+
+    await vipCol.updateOne(
+      { userId: u.id },
+      { $set: { userId: u.id, permanent: false, expiresAt: exp, alerts: {} } },
+      { upsert: true }
+    );
+
+    updateVipList("vip_add");
+    return i.reply({ content: `✅ VIP jusqu’au <t:${unix(exp)}:F>`, flags: EPHEMERAL });
   }
 
-  const guild = await getGuild();
-  const vipRole = await guild.roles.fetch(ENV.VIP_ROLE_ID).catch(() => null);
+  if (i.commandName === "vip_perm") {
+    const u = i.options.getUser("joueur");
+    const m = await g.members.fetch(u.id);
+    await m.roles.add(role);
 
-  try {
-    if (interaction.commandName === "vip_add") {
-      const user = interaction.options.getUser("joueur", true);
-      const days = interaction.options.getInteger("jours", true);
-      const note = interaction.options.getString("note") || "";
+    await vipCol.updateOne(
+      { userId: u.id },
+      { $set: { userId: u.id, permanent: true, expiresAt: null, alerts: {} } },
+      { upsert: true }
+    );
 
-      const member = await guild.members.fetch(user.id);
+    updateVipList("vip_perm");
+    return i.reply({ content: `👑 VIP permanent`, flags: EPHEMERAL });
+  }
 
-      if (vipRole && !member.roles.cache.has(vipRole.id)) {
-        await member.roles.add(vipRole.id, "VIP add/extend");
-      }
+  if (i.commandName === "vip_remove") {
+    const u = i.options.getUser("joueur");
+    await vipCol.deleteOne({ userId: u.id });
+    try {
+      const m = await g.members.fetch(u.id);
+      await m.roles.remove(role);
+    } catch {}
+    updateVipList("vip_remove");
+    return i.reply({ content: "❌ VIP retiré", flags: EPHEMERAL });
+  }
 
-      const res = await addOrExtendVip(user.id, days, note);
+  if (i.commandName === "vip_list") {
+    const all = await vipCol.find({}).toArray();
+    if (!all.length) return i.reply({ content: "Aucun VIP", flags: EPHEMERAL });
 
-      // Update list + check expirations juste après (pour créer des alertes si proche)
-      scheduleVipListUpdate("vip_add");
-      checkVipExpirations().catch(() => {});
+    const lines = all.map(v =>
+      v.permanent
+        ? `🟣 <@${v.userId}> — Permanent`
+        : `🟢 <@${v.userId}> — expire <t:${unix(new Date(v.expiresAt))}:F>`
+    );
 
-      if (res.mode === "permanent") {
-        return interaction.reply({ content: `✅ <@${user.id}> est **VIP permanent**.`, flags: EPHEMERAL_FLAGS });
-      }
+    return i.reply({ content: lines.join("\n"), flags: EPHEMERAL });
+  }
 
-      const exp = Math.floor(new Date(res.expiresAt).getTime() / 1000);
-      return interaction.reply({
-        content: `✅ VIP prolongé pour <@${user.id}> : **+${days} jours** → expire <t:${exp}:F>. (grâce ${GRACE_DAYS} jours)`,
-        flags: EPHEMERAL_FLAGS,
-      });
-    }
-
-    if (interaction.commandName === "vip_perm") {
-      const user = interaction.options.getUser("joueur", true);
-      const note = interaction.options.getString("note") || "VIP permanent";
-
-      const member = await guild.members.fetch(user.id);
-      if (vipRole && !member.roles.cache.has(vipRole.id)) {
-        await member.roles.add(vipRole.id, "VIP permanent");
-      }
-
-      await setPermanentVip(user.id, note);
-      scheduleVipListUpdate("vip_perm");
-
-      return interaction.reply({ content: `✅ <@${user.id}> est maintenant **VIP permanent**.`, flags: EPHEMERAL_FLAGS });
-    }
-
-    if (interaction.commandName === "vip_remove") {
-      const user = interaction.options.getUser("joueur", true);
-
-      const member = await guild.members.fetch(user.id).catch(() => null);
-      if (member && vipRole && member.roles.cache.has(vipRole.id)) {
-        await member.roles.remove(vipRole.id, "VIP removed");
-      }
-
-      await deleteVip(user.id);
-      scheduleVipListUpdate("vip_remove");
-
-      return interaction.reply({
-        content: `✅ VIP retiré pour <@${user.id}> (rôle + enregistrement supprimés).`,
-        flags: EPHEMERAL_FLAGS,
-      });
-    }
-
-    if (interaction.commandName === "vip_info") {
-      const user = interaction.options.getUser("joueur", true);
-      const info = await getVip(user.id);
-
-      if (!info) {
-        return interaction.reply({ content: `ℹ️ <@${user.id}> n'a pas d'enregistrement VIP.`, flags: EPHEMERAL_FLAGS });
-      }
-
-      if (info.permanent) {
-        return interaction.reply({
-          content: `👑 <@${user.id}> est **VIP permanent**.\n📝 Note: ${info.note || "—"}\n🕒 Maj: ${info.updatedAt?.toISOString?.() || "—"}`,
-          flags: EPHEMERAL_FLAGS,
-        });
-      }
-
-      const exp = info.expiresAt ? new Date(info.expiresAt) : null;
-      const expTs = exp ? toUnixTs(exp) : null;
-      const graceEndTs = exp ? Math.floor((exp.getTime() + GRACE_DAYS * DAY_MS) / 1000) : null;
-
-      return interaction.reply({
-        content:
-          `👑 <@${user.id}> VIP temporaire.\n` +
-          `⏰ Échéance: ${expTs ? `<t:${expTs}:F>` : "—"}\n` +
-          `🕒 Fin de grâce (${GRACE_DAYS}j): ${graceEndTs ? `<t:${graceEndTs}:F>` : "—"}\n` +
-          `📝 Note: ${info.note || "—"}`,
-        flags: EPHEMERAL_FLAGS,
-      });
-    }
-
-    if (interaction.commandName === "vip_refresh") {
-      scheduleVipListUpdate("vip_refresh");
-      return interaction.reply({ content: "✅ Mise à jour de la liste VIP lancée.", flags: EPHEMERAL_FLAGS });
-    }
-  } catch (e) {
-    console.error("❌ interaction error:", e?.message || e);
-    return interaction.reply({ content: `❌ Erreur: ${e?.message || e}`, flags: EPHEMERAL_FLAGS }).catch(() => {});
+  if (i.commandName === "vip_refresh") {
+    updateVipList("manual");
+    return i.reply({ content: "🔄 Mise à jour lancée", flags: EPHEMERAL });
   }
 });
 
-// ===================== INSTANT LIST UPDATE =====================
-client.on("guildMemberUpdate", async (oldMember, newMember) => {
-  const vip = ENV.VIP_ROLE_ID;
-
-  if (oldMember.partial) { try { oldMember = await oldMember.fetch(); } catch {} }
-  if (newMember.partial) { try { newMember = await newMember.fetch(); } catch {} }
-
-  const before = oldMember.roles.cache.has(vip);
-  const after = newMember.roles.cache.has(vip);
-
-  if (before !== after) scheduleVipListUpdate(after ? "VIP added" : "VIP removed");
-});
-
-client.on("guildMemberRemove", () => {
-  scheduleVipListUpdate("member left");
-});
-
-// ===================== READY =====================
+/* ===================== READY ===================== */
 client.once("clientReady", async () => {
   console.log(`🤖 Connecté : ${client.user.tag}`);
 
   await initMongo();
-  await registerGuildCommands();
 
-  scheduleVipListUpdate("startup");
-  await checkVipExpirations().catch(() => {});
+  const rest = new REST({ version: "10" }).setToken(ENV.DISCORD_TOKEN);
+  await rest.put(Routes.applicationGuildCommands(ENV.CLIENT_ID, ENV.GUILD_ID), { body: commands });
+  console.log("✅ Slash commands enregistrées");
 
-  setInterval(() => {
-    checkVipExpirations().catch((e) => console.error("❌ checkVipExpirations:", e?.message || e));
-  }, EXPIRY_CHECK_EVERY_MS);
-
-  setInterval(() => scheduleVipListUpdate("periodic safety"), VIP_LIST_SAFETY_EVERY_MS);
+  updateVipList("startup");
+  setInterval(checkExpirations, 5 * 60 * 1000);
 });
 
 client.login(ENV.DISCORD_TOKEN);
