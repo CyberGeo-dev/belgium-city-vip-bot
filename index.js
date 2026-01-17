@@ -28,7 +28,6 @@ function must(name) {
   if (!v) throw new Error(`Missing env var: ${name}`);
   return v;
 }
-
 must("DISCORD_TOKEN");
 must("CLIENT_ID");
 must("GUILD_ID");
@@ -38,17 +37,15 @@ must("STAFF_ALERT_CHANNEL_ID");
 must("MONGODB_URI");
 
 // ===================== CONSTANTS =====================
-const EPHEMERAL_FLAGS = 1 << 6; // MessageFlags.Ephemeral
+const EPHEMERAL_FLAGS = 1 << 6;
 const GRACE_DAYS = 3;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// Rappels
 const REMIND_D3 = 3;
 const REMIND_D1 = 1;
 
-// Fréquences
-const EXPIRY_CHECK_EVERY_MS = 5 * 60 * 1000;      // 5 min
-const VIP_LIST_SAFETY_EVERY_MS = 15 * 60 * 1000;  // 15 min
+const EXPIRY_CHECK_EVERY_MS = 5 * 60 * 1000;
+const VIP_LIST_SAFETY_EVERY_MS = 15 * 60 * 1000;
 
 // ===================== MONGODB =====================
 let mongo;
@@ -73,7 +70,6 @@ async function initMongo() {
 //   expiresAt: Date | null,
 //   note: "texte",
 //   alerts: { d3:true, d1:true, d0:true, removed:true },
-//   createdAt: Date,
 //   updatedAt: Date
 // }
 
@@ -93,29 +89,38 @@ function addDays(baseDate, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d;
 }
+
 function toUnixTs(date) {
   return Math.floor(date.getTime() / 1000);
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 async function getGuild() {
   return await client.guilds.fetch(ENV.GUILD_ID);
 }
+
 async function getVipChannel() {
   const ch = await client.channels.fetch(ENV.VIP_CHANNEL_ID);
   if (!ch?.isTextBased()) throw new Error("VIP_CHANNEL_ID n'est pas un salon texte.");
   return ch;
 }
+
 async function getStaffAlertChannel() {
   const ch = await client.channels.fetch(ENV.STAFF_ALERT_CHANNEL_ID);
   if (!ch?.isTextBased()) throw new Error("STAFF_ALERT_CHANNEL_ID n'est pas un salon texte.");
   return ch;
 }
+
 function isAdminInteraction(interaction) {
   return (
     interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ||
     interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)
   );
 }
+
 async function sendStaffAlert(text) {
   const ch = await getStaffAlertChannel();
   await ch.send({ content: text });
@@ -205,22 +210,29 @@ async function getVip(userId) {
   return await vipCol.findOne({ userId });
 }
 
-// ✅ IMPORTANT: pas de alerts dans $setOnInsert (sinon conflit)
+/**
+ * FIX IMPORTANT:
+ * On ne met PAS "alerts" à la fois dans $set et $setOnInsert sinon Mongo renvoie:
+ * "Updating the path 'alerts' would create a conflict at 'alerts'"
+ */
 async function upsertVip(userId, patch) {
-  const set = {
+  const setDoc = {
     ...patch,
     userId,
     updatedAt: new Date(),
   };
 
-  await vipCol.updateOne(
-    { userId },
-    {
-      $set: set,
-      $setOnInsert: { createdAt: new Date() },
-    },
-    { upsert: true }
-  );
+  const update = {
+    $set: setDoc,
+    $setOnInsert: { createdAt: new Date() },
+  };
+
+  // si patch ne contient pas alerts, on initialise alerts à l'insertion
+  if (!Object.prototype.hasOwnProperty.call(patch, "alerts")) {
+    update.$setOnInsert.alerts = {};
+  }
+
+  await vipCol.updateOne({ userId }, update, { upsert: true });
 }
 
 async function deleteVip(userId) {
@@ -230,7 +242,6 @@ async function deleteVip(userId) {
 async function addOrExtendVip(userId, days, note = "") {
   const existing = await getVip(userId);
 
-  // permanent -> ne touche pas expiresAt
   if (existing?.permanent) {
     await upsertVip(userId, { note: note || existing.note || "" });
     return { mode: "permanent", expiresAt: null };
@@ -245,7 +256,7 @@ async function addOrExtendVip(userId, days, note = "") {
     permanent: false,
     expiresAt: newExp,
     note: note || existing?.note || "",
-    alerts: {}, // reset flags au renouvellement
+    alerts: {}, // reset alerts on renew
   });
 
   return { mode: "temporary", expiresAt: newExp.toISOString() };
@@ -256,7 +267,7 @@ async function setPermanentVip(userId, note = "") {
     permanent: true,
     expiresAt: null,
     note: note || "VIP permanent",
-    alerts: {}, // reset flags
+    alerts: {}, // ok: patch contient alerts -> pas de setOnInsert.alerts
   });
 }
 
@@ -267,7 +278,6 @@ async function checkVipExpirations() {
   const now = Date.now();
 
   const cursor = vipCol.find({ permanent: { $ne: true }, expiresAt: { $ne: null } });
-
   for await (const info of cursor) {
     const userId = info.userId;
     const alerts = info.alerts || {};
@@ -326,6 +336,139 @@ async function checkVipExpirations() {
   }
 }
 
+// ===================== /vip_list (DB) =====================
+async function listDbVips({ page = 1, expiringOnly = false }) {
+  const now = Date.now();
+  const perPage = 25;
+
+  const docs = await vipCol.find({}).toArray();
+
+  let rows = docs.map((d) => {
+    const permanent = !!d.permanent;
+
+    let expTs = null;
+    let remainingDays = null;
+
+    if (!permanent && d.expiresAt) {
+      const expMs = new Date(d.expiresAt).getTime();
+      expTs = Math.floor(expMs / 1000);
+      remainingDays = Math.ceil((expMs - now) / DAY_MS);
+    }
+
+    return {
+      userId: d.userId,
+      permanent,
+      expTs,
+      remainingDays,
+      note: d.note || "—",
+    };
+  });
+
+  if (expiringOnly) {
+    rows = rows.filter((r) => !r.permanent && r.remainingDays !== null && r.remainingDays <= 14);
+  }
+
+  rows.sort((a, b) => {
+    if (a.permanent && !b.permanent) return 1;
+    if (!a.permanent && b.permanent) return -1;
+    if (!a.permanent && !b.permanent) return (a.expTs ?? 0) - (b.expTs ?? 0);
+    return 0;
+  });
+
+  const total = rows.length;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const slice = rows.slice((safePage - 1) * perPage, safePage * perPage);
+
+  return { total, totalPages, safePage, slice };
+}
+
+// ===================== /vip_sync =====================
+async function vipSync({ removeExtra = false }) {
+  const guild = await getGuild();
+  await guild.members.fetch();
+
+  const role = await guild.roles.fetch(ENV.VIP_ROLE_ID);
+  const roleId = role.id;
+
+  const now = Date.now();
+
+  // valid = permanent OR now < graceEnd (keep role during grace)
+  const validIds = new Set();
+  const cursor = vipCol.find({});
+  for await (const v of cursor) {
+    if (v.permanent) {
+      validIds.add(v.userId);
+      continue;
+    }
+    if (v.expiresAt) {
+      const expMs = new Date(v.expiresAt).getTime();
+      const graceEndMs = expMs + GRACE_DAYS * DAY_MS;
+      if (now < graceEndMs) validIds.add(v.userId);
+    }
+  }
+
+  let added = 0;
+  let already = 0;
+  let removedExpired = 0;
+  let removedExtra = 0;
+  let processed = 0;
+
+  // 1) Ensure role for validIds
+  for (const userId of validIds) {
+    processed++;
+    try {
+      const member = await guild.members.fetch(userId);
+      if (!member.roles.cache.has(roleId)) {
+        await member.roles.add(roleId, "vip_sync: restore role from DB");
+        added++;
+      } else {
+        already++;
+      }
+    } catch {
+      // member not found in guild
+    }
+
+    if (processed % 5 === 0) await sleep(500);
+  }
+
+  // 2) Remove role for DB users expired after grace (safety)
+  const expiredCursor = vipCol.find({ permanent: { $ne: true }, expiresAt: { $ne: null } });
+  for await (const v of expiredCursor) {
+    const expMs = new Date(v.expiresAt).getTime();
+    const graceEndMs = expMs + GRACE_DAYS * DAY_MS;
+    if (now >= graceEndMs) {
+      try {
+        const member = await guild.members.fetch(v.userId);
+        if (member.roles.cache.has(roleId)) {
+          await member.roles.remove(roleId, "vip_sync: expired after grace");
+          removedExpired++;
+          await sleep(300);
+        }
+      } catch {}
+    }
+  }
+
+  // 3) Option: remove users who have role but are not validIds
+  if (removeExtra) {
+    const membersWithRole = [...role.members.values()];
+    let i = 0;
+    for (const m of membersWithRole) {
+      i++;
+      if (!validIds.has(m.id)) {
+        try {
+          await m.roles.remove(roleId, "vip_sync: remove extra role not in DB");
+          removedExtra++;
+        } catch {}
+      }
+      if (i % 5 === 0) await sleep(500);
+    }
+  }
+
+  scheduleVipListUpdate("vip_sync");
+  return { validCount: validIds.size, added, already, removedExpired, removedExtra };
+}
+
 // ===================== SLASH COMMANDS =====================
 const commands = [
   new SlashCommandBuilder()
@@ -357,24 +500,26 @@ const commands = [
     .addUserOption((o) => o.setName("joueur").setDescription("Le joueur").setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
-  // ✅ RE-ADD vip_list (comme avant)
   new SlashCommandBuilder()
     .setName("vip_list")
-    .setDescription("Liste tous les VIP enregistrés (temporaire + permanent).")
-    .addIntegerOption((o) =>
-      o.setName("page").setDescription("Numéro de page (25 VIP par page)").setRequired(false)
-    )
+    .setDescription("Liste tous les VIP enregistrés (temporaire + permanent) depuis la DB.")
+    .addIntegerOption((o) => o.setName("page").setDescription("Page (25 par page)").setRequired(false))
     .addBooleanOption((o) =>
-      o
-        .setName("expiring_only")
-        .setDescription("Seulement ceux qui expirent bientôt (<= 14 jours)")
-        .setRequired(false)
+      o.setName("expiring_only").setDescription("Seulement ceux qui expirent bientôt (<= 14 jours)").setRequired(false)
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+
+  new SlashCommandBuilder()
+    .setName("vip_sync")
+    .setDescription("Synchronise le rôle VIP avec la base de données (restore + cleanup).")
+    .addBooleanOption((o) =>
+      o.setName("remove_extra").setDescription("Retirer le rôle aux gens pas présents/valides dans la DB").setRequired(false)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   new SlashCommandBuilder()
     .setName("vip_refresh")
-    .setDescription("Force la mise à jour de la liste VIP.")
+    .setDescription("Force la mise à jour de la liste VIP (message embed).")
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 ].map((c) => c.toJSON());
 
@@ -474,10 +619,7 @@ client.on("interactionCreate", async (interaction) => {
 
       if (info.permanent) {
         return interaction.reply({
-          content:
-            `👑 <@${user.id}> est **VIP permanent**.\n` +
-            `📝 Note: ${info.note || "—"}\n` +
-            `🕒 Maj: ${info.updatedAt ? info.updatedAt.toISOString() : "—"}`,
+          content: `👑 <@${user.id}> est **VIP permanent**.\n📝 Note: ${info.note || "—"}`,
           flags: EPHEMERAL_FLAGS,
         });
       }
@@ -500,40 +642,7 @@ client.on("interactionCreate", async (interaction) => {
       const page = interaction.options.getInteger("page") || 1;
       const expiringOnly = interaction.options.getBoolean("expiring_only") || false;
 
-      const now = Date.now();
-      const all = await vipCol.find({}).toArray();
-
-      let rows = all.map((info) => {
-        const permanent = !!info.permanent;
-
-        let expTs = null;
-        let remainingDays = null;
-
-        if (!permanent && info.expiresAt) {
-          const expMs = new Date(info.expiresAt).getTime();
-          expTs = Math.floor(expMs / 1000);
-          remainingDays = Math.ceil((expMs - now) / DAY_MS);
-        }
-
-        return { userId: info.userId, permanent, expTs, remainingDays, note: info.note || "—" };
-      });
-
-      if (expiringOnly) {
-        rows = rows.filter((r) => !r.permanent && r.remainingDays !== null && r.remainingDays <= 14);
-      }
-
-      rows.sort((a, b) => {
-        if (a.permanent && !b.permanent) return 1;
-        if (!a.permanent && b.permanent) return -1;
-        if (!a.permanent && !b.permanent) return (a.expTs ?? 0) - (b.expTs ?? 0);
-        return 0;
-      });
-
-      const perPage = 25;
-      const total = rows.length;
-      const totalPages = Math.max(1, Math.ceil(total / perPage));
-      const safePage = Math.min(Math.max(1, page), totalPages);
-      const slice = rows.slice((safePage - 1) * perPage, safePage * perPage);
+      const { total, totalPages, safePage, slice } = await listDbVips({ page, expiringOnly });
 
       if (slice.length === 0) {
         return interaction.reply({
@@ -544,12 +653,14 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      const now = Date.now();
       const lines = slice.map((r) => {
         if (r.permanent) return `🟣 <@${r.userId}> — **Permanent** — ${r.note}`;
 
         const d = r.remainingDays ?? "?";
         const when = r.expTs ? `<t:${r.expTs}:F>` : "—";
         const badge = d <= 0 ? "🔴" : d <= 3 ? "🟠" : d <= 7 ? "🟡" : "🟢";
+
         return `${badge} <@${r.userId}> — échéance ${when} (**J-${d}**) — ${r.note}`;
       });
 
@@ -559,6 +670,22 @@ client.on("interactionCreate", async (interaction) => {
 
       return interaction.reply({
         content: `${header}\nPage **${safePage}/${totalPages}**\n\n${lines.join("\n")}`,
+        flags: EPHEMERAL_FLAGS,
+      });
+    }
+
+    if (interaction.commandName === "vip_sync") {
+      const removeExtra = interaction.options.getBoolean("remove_extra") || false;
+      const res = await vipSync({ removeExtra });
+
+      return interaction.reply({
+        content:
+          `✅ **Sync terminé**\n` +
+          `• VIP valides en DB: **${res.validCount}**\n` +
+          `• Rôles ajoutés: **${res.added}**\n` +
+          `• Déjà OK: **${res.already}**\n` +
+          `• Retirés (expirés après grâce): **${res.removedExpired}**\n` +
+          `• Retirés (extra hors DB/invalides): **${res.removedExtra}**`,
         flags: EPHEMERAL_FLAGS,
       });
     }
@@ -583,14 +710,10 @@ client.on("guildMemberUpdate", async (oldMember, newMember) => {
   const vip = ENV.VIP_ROLE_ID;
 
   if (oldMember.partial) {
-    try {
-      oldMember = await oldMember.fetch();
-    } catch {}
+    try { oldMember = await oldMember.fetch(); } catch {}
   }
   if (newMember.partial) {
-    try {
-      newMember = await newMember.fetch();
-    } catch {}
+    try { newMember = await newMember.fetch(); } catch {}
   }
 
   const before = oldMember.roles.cache.has(vip);
@@ -614,9 +737,7 @@ client.once("clientReady", async () => {
   await checkVipExpirations().catch(() => {});
 
   setInterval(() => {
-    checkVipExpirations().catch((e) =>
-      console.error("❌ checkVipExpirations:", e?.message || e)
-    );
+    checkVipExpirations().catch((e) => console.error("❌ checkVipExpirations:", e?.message || e));
   }, EXPIRY_CHECK_EVERY_MS);
 
   setInterval(() => scheduleVipListUpdate("periodic safety"), VIP_LIST_SAFETY_EVERY_MS);
